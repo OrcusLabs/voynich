@@ -1,44 +1,71 @@
 #!/usr/bin/env python3
+"""
+vw_suite_allinone_paper_v20.py — Voynich Structural Analysis Suite (inline parser)
+
+Deterministic, leakage-free character-level structural tests for the Voynich
+Manuscript (LSI transcription) and control corpora.
+
+- Inline IVTFF tag-aware parser (no iParser dependency)
+- Embedded exclusion list for physically missing folios (from iParser_guarded)
+- Numeric folio sorting (supports suffix digits like f101r2)
+- Train/test split is folio-based by side(s)
+
+Defaults:
+- preset=recipe (folios 103–116)
+- train_sides=r, test_sides=v
+- transcriber=H
+- min_len=2
+- K=0.1
+"""
+
 import argparse
 import math
 import unicodedata
-import random
+import re
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
 
 # ----------------------------
-# Usage
-#-----------------------------
-
-# Recipe, rectos → versos
+# Usage (copy/paste examples)
+# ----------------------------
+#
+# Recipe section (folios 103–116), rectos → versos
 # python vw_suite.py --preset recipe --train_sides r --test_sides v
 #
-# Herbal, rectos → versos
-# python vw_suite.py --preset herbal --train_sides r --test_sides v
+# Herbal section (folios 1–66), rectos → versos
+# python vw_suite_v20.py --preset herbal --train_sides r --test_sides v
 #
-# Train on versos, test on rectos (reverse sanity check)
-# python vw_suite.py --preset recipe --train_sides v --test_sides r
+# Reverse sanity check: train on versos, test on rectos
+# python vw_suite_v20.py --preset recipe --train_sides v --test_sides r
 #
 # Whole corpus, train on rectos, test on versos
-# python vw_suite.py --preset all --train_sides r --test_sides v
+# python vw_suite_v20.py --preset all --train_sides r --test_sides v
 #
-# Custom folio range
-# python vw_suite.py --start 90 --end 116 --train_sides r --test_sides v
+# Custom folio range (inclusive), rectos → versos
+# python vw_suite_v20.py --start 90 --end 116 --train_sides r --test_sides v
 #
-# Write CSV outputs
-# python vw_suite.py --preset recipe --train_sides r --test_sides v --csv_prefix vw_recipe
+# Set smoothing parameter K (example: K=1.0)
+# python vw_suite_v20.py --preset recipe --train_sides r --test_sides v --K 1.0
 #
-# Symmetric (Default)
-# python vw_suite.py --preset recipe --train_sides r --test_sides v --symmetric_short_filter true
+# Shuffle TEST tokens only (within-word shuffle)
+# python vw_suite_v20.py --preset recipe --train_sides r --test_sides v --randomize within_tokens --rand_seed 1
 #
-# Asymmetric (test-only filter)
-# python vw_suite.py --preset recipe --train_sides r --test_sides v --symmetric_short_filter false
+# Shuffle TEST tokens only (global character shuffle; preserves token lengths)
+# python vw_suite_v20.py --preset recipe --train_sides r --test_sides v --randomize global_chars --rand_seed 1
+#
+# Dump unseen bigram counts (CSV)
+# python vw_suite_v20.py --preset recipe --train_sides r --test_sides v --dump_unseen_bigrams out/unseen_bigrams.csv
+#
+# Run on a Project Gutenberg text (auto-strips headers, splits 50/50)
+# python vw_suite_v20.py --corpus text --text_file pg11940.txt --min_len 2 --K 0.1
 
 
-# ----------------------------
-# Normalization
-# ----------------------------
+# ============================================================
+# NORMALIZATION + TOKENIZATION
+# ============================================================
+
 def normalize_az(s: str) -> str:
     s = unicodedata.normalize("NFD", s)
     out = []
@@ -60,593 +87,614 @@ def tokenize(text: str, min_len: int = 2) -> list[str]:
     norm = normalize_az(text)
     return [w for w in norm.split() if len(w) >= min_len]
 
-# ----------------------------
-# Voynich via iParser
-# ----------------------------
-def import_iparser(iparser_dir: str):
-    import sys
-    sys.path.insert(0, iparser_dir)
-    import iParser_guarded as ip
-    return ip
+# ============================================================
+# EXCLUSION LIST (physically missing folios)
+# (Embedded from iParser_guarded)
+# ============================================================
 
-def folio_num(folio_id: str) -> int | None:
-    # folio IDs like "f103r", "f114v" etc.
-    digits = "".join(ch for ch in folio_id if ch.isdigit())
-    if not digits:
-        return None
-    return int(digits)
+EXCLUDED_FOLIOS = {
+    'f12r', 'f12v', 'f59r', 'f59v', 'f60r', 'f60v', 'f61r', 'f61v', 'f62r', 'f62v', 'f63r', 'f63v', 'f64r', 'f64v', 'f101r2', 'f109r', 'f109v', 'f110r', 'f110v', 'f116v'
+}
 
-def select_folios(ip, lsi_path: str, transcriber: str,
-                  start: int | None, end: int | None,
-                  sides: str) -> list[str]:
+# ============================================================
+# LSI PARSER (INLINE, IVTFF-AWARE)
+# ============================================================
+
+# Base folio id: f<num><side><optional_suffix_digits>
+_FOLIO_ID_RE = re.compile(r"^f(\d+)(r|v)(\d*)$", re.IGNORECASE)
+
+# IVTFF transcription line:
+#   <f103r.1,@P0;H> payload...
+# Capture: num, side, suffix, transcriber, payload
+_LSI_LINE_RE = re.compile(r"^<f(\d+)(r|v)(\d*)\.[^;]*;([A-Za-z])>\s*(.*)$", re.IGNORECASE)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+def folio_num(fid: str) -> int:
+    m = _FOLIO_ID_RE.match(fid.strip())
+    if not m:
+        raise ValueError(f"Malformed folio ID: {fid}")
+    return int(m.group(1))
+
+def folio_side(fid: str) -> str:
+    m = _FOLIO_ID_RE.match(fid.strip())
+    if not m:
+        raise ValueError(f"Malformed folio ID: {fid}")
+    return m.group(2).lower()
+
+def folio_suffix(fid: str) -> int:
+    m = _FOLIO_ID_RE.match(fid.strip())
+    if not m:
+        raise ValueError(f"Malformed folio ID: {fid}")
+    sfx = m.group(3)
+    return int(sfx) if sfx else 0
+
+def folio_sort_key(fid: str):
+    return (folio_num(fid), folio_side(fid), folio_suffix(fid))
+
+def parse_lsi_lines(lsi_path: str, transcriber: str = "H"):
     """
-    sides: 'r', 'v', or 'both'
+    Yields (folio_id, payload) for the specified transcriber.
+    Skips excluded folios.
     """
-    all_f = ip.list_folios(lsi_path, transcriber=transcriber)
+    text = Path(lsi_path).read_text(encoding="utf-8", errors="replace")
+    found = False
+    tr = (transcriber or "").strip()
+    if len(tr) != 1:
+        raise ValueError("--transcriber must be a single character (e.g., H, C, F, N, U)")
+    tr = tr.upper()
+
+    for ln, line in enumerate(text.splitlines(), start=1):
+        if not line.startswith("<f"):
+            continue
+        m = _LSI_LINE_RE.match(line)
+        if not m:
+            continue
+        num, side, sfx, trc, payload = m.groups()
+        if trc.upper() != tr:
+            continue
+        fid = f"f{int(num)}{side.lower()}{sfx}"
+        if fid.lower() in EXCLUDED_FOLIOS:
+            continue
+        payload = _TAG_RE.sub(" ", payload)
+        if not payload.strip():
+            print(f"WARNING: empty payload on line {ln}", file=sys.stderr)
+            continue
+        found = True
+        yield fid, payload
+
+    if not found:
+        raise ValueError(f"No valid transcription lines found for transcriber '{tr}' in LSI file")
+
+def list_folios(lsi_path: str, transcriber: str = "H"):
+    fols = set()
+    for fid, _payload in parse_lsi_lines(lsi_path, transcriber=transcriber):
+        fols.add(fid)
+    out = sorted(fols, key=folio_sort_key)
+    return out
+
+def select_folios(lsi_path, start, end, sides, transcriber: str = "H"):
+    allowed = set((sides or "").lower())
+    if not allowed or not allowed.issubset({"r", "v"}):
+        raise ValueError("--train_sides/--test_sides must be one of: r, v, rv")
     out = []
-    for f in all_f:
-        if not f.startswith("f"):
-            continue
-        n = folio_num(f)
-        if n is None:
-            continue
+    for fid in list_folios(lsi_path, transcriber=transcriber):
+        n = folio_num(fid)
         if start is not None and n < start:
             continue
         if end is not None and n > end:
             continue
-
-        if sides == "r" and not f.endswith("r"):
+        if folio_side(fid) not in allowed:
             continue
-        if sides == "v" and not f.endswith("v"):
-            continue
-        out.append(f)
-    return sorted(out)
-
-def load_tokens_for_folios(ip, lsi_path: str, transcriber: str,
-                          folios: list[str], min_len: int) -> list[str]:
-    toks = []
-    for fol in folios:
-        for (_, _, line) in ip.parse_folio_lines_normalized(lsi_path, fol, transcriber=transcriber):
-            toks.extend(tokenize(line, min_len=min_len))
-    return toks
-
-# ----------------------------
-# Metrics: bigram legality (anywhere)
-# ----------------------------
-def bigram_legality_reject_rate(train_tokens: list[str], test_tokens: list[str]) -> float:
-    train_bi = set()
-    for w in train_tokens:
-        for i in range(len(w) - 1):
-            train_bi.add(w[i:i+2])
-
-    rejects = 0
-    for w in test_tokens:
-        ok = True
-        for i in range(len(w) - 1):
-            if w[i:i+2] not in train_bi:
-                ok = False
-                break
-        if not ok:
-            rejects += 1
-
-    return (rejects / len(test_tokens) * 100.0) if test_tokens else float("nan")
-
-# ----------------------------
-# Metrics: n-gram bits per character (bigram/trigram)
-# ----------------------------
-K = 0.1  # fixed add-k smoothing
-
-def train_char_ngram(tokens: list[str], n: int):
-    counts = Counter()
-    ctx = Counter()
-    alph = set(["^", "$"])
-    for w in tokens:
-        seq = "^"*(n-1) + w + "$"
-        for ch in seq:
-            alph.add(ch)
-        for i in range(n-1, len(seq)):
-            ng = tuple(seq[i-(n-1):i+1])
-            counts[ng] += 1
-            ctx[ng[:-1]] += 1
-    return counts, ctx, alph, n
-
-def score_char_ngram_bits_per_char(tokens: list[str], model):
-    counts, ctx, alph, n = model
-    V = len(alph)
-    logp = 0.0
-    chars = 0
-    for w in tokens:
-        seq = "^"*(n-1) + w + "$"
-        for i in range(n-1, len(seq)):
-            ng = tuple(seq[i-(n-1):i+1])
-            p = (counts.get(ng, 0) + K) / (ctx.get(ng[:-1], 0) + K*V)
-            logp += -math.log2(p)
-            if ng[-1] != "$":
-                chars += 1
-    bits = (logp / chars) if chars else float("nan")
-    ppl = (2**bits) if chars else float("nan")
-    return bits, ppl
-
-# ----------------------------
-# Metrics: positional bigram bits (init/med/final)
-# ----------------------------
-def positional_bigram_bits(train_tokens: list[str], test_tokens: list[str]):
-    # Model per zone: init/med/fin, where zone is based on bigram position i
-    counts = {z: Counter() for z in ("init", "med", "fin")}
-    ctx = {z: Counter() for z in ("init", "med", "fin")}
-    V = 26
-
-    for w in train_tokens:
-        L = len(w)
-        for i in range(L - 1):
-            z = "init" if i == 0 else ("fin" if i == L - 2 else "med")
-            prev, nxt = w[i], w[i+1]
-            counts[z][(prev, nxt)] += 1
-            ctx[z][prev] += 1
-
-    out = {}
-    for z in ("init", "med", "fin"):
-        logp = 0.0
-        steps = 0
-        for w in test_tokens:
-            L = len(w)
-            for i in range(L - 1):
-                zz = "init" if i == 0 else ("fin" if i == L - 2 else "med")
-                if zz != z:
-                    continue
-                prev, nxt = w[i], w[i+1]
-                p = (counts[z].get((prev, nxt), 0) + K) / (ctx[z].get(prev, 0) + K*V)
-                logp += -math.log2(p)
-                steps += 1
-        out[z] = (logp / steps) if steps else float("nan")
-
+        out.append(fid)
+    out.sort(key=folio_sort_key)
     return out
 
-# ----------------------------
-# Metrics: edit distance <=1 proxy (dist0/dist1)
-# ----------------------------
-def build_dist1_index(train_types: set[str]):
-    train_set = set(train_types)
-    delmap = defaultdict(set)  # deleted_string -> set(lengths of originals)
-    for w in train_set:
-        L = len(w)
-        for i in range(L):
-            delmap[w[:i] + w[i+1:]].add(L)
-    return train_set, delmap
+def load_voynich_tokens(lsi_path, folios, min_len, transcriber: str = "H"):
+    tokens = []
+    folio_set = set(folios)
+    for fid, payload in parse_lsi_lines(lsi_path, transcriber=transcriber):
+        if fid in folio_set:
+            tokens.extend(tokenize(payload, min_len))
+    return tokens
 
-def has_dist1(w: str, train_set: set[str], delmap) -> bool:
-    L = len(w)
-
-    # insertion: a training word of length L+1 deletes to w
-    if (w in delmap) and ((L + 1) in delmap[w]):
-        return True
-
-    for i in range(L):
-        d = w[:i] + w[i+1:]
-
-        # deletion from w matches a training word
-        if d in train_set:
-            return True
-
-        # substitution: w delete-one equals train delete-one (same length)
-        if (d in delmap) and (L in delmap[d]):
-            return True
-
-    return False
-
-def dist01_rates(train_tokens: list[str], test_tokens: list[str]):
-    train_types = set(train_tokens)
-    train_set, delmap = build_dist1_index(train_types)
-
-    test_counts = Counter(test_tokens)
-    total_tok = sum(test_counts.values())
-    total_types = len(test_counts)
-
-    d0_tok = d1_tok = 0
-    d0_type = d1_type = 0
-
-    for w, c in test_counts.items():
-        if w in train_set:
-            d0_tok += c
-            d0_type += 1
-        elif has_dist1(w, train_set, delmap):
-            d1_tok += c
-            d1_type += 1
-
-    if total_tok == 0 or total_types == 0:
-        return {}
-
-    return {
-        "dist0_tok_pct": d0_tok / total_tok * 100.0,
-        "dist1_tok_pct": d1_tok / total_tok * 100.0,
-        "le1_tok_pct": (d0_tok + d1_tok) / total_tok * 100.0,
-        "le1_type_pct": (d0_type + d1_type) / total_types * 100.0,
-    }
-
-# ----------------------------
-# positional legality: onset / interior / coda
-# ----------------------------
-def train_onset_interior_coda(train_tokens: list[str]):
-    onsets = set()
-    interior = set()
-    codas = set()
-    for w in train_tokens:
-        L = len(w)
-        if L >= 2:
-            onsets.add(w[:2])
-            codas.add(w[-2:])
-        # interior: positions 1..L-3 (bigram start index)
-        for i in range(1, L - 2):
-            interior.add(w[i:i+2])
-    return onsets, interior, codas
-
-def reject_onset_interior_coda(w: str, sets) -> bool:
-    onsets, interior, codas = sets
-    L = len(w)
-    if L < 2:
-        return True
-    if w[:2] not in onsets:
-        return True
-    if w[-2:] not in codas:
-        return True
-    for i in range(1, L - 2):
-        if w[i:i+2] not in interior:
-            return True
-    return False
-
-def onset_interior_coda_reject_rate(train_tokens: list[str], test_tokens: list[str]) -> float:
-    sets = train_onset_interior_coda(train_tokens)
-    rejects = sum(1 for w in test_tokens if reject_onset_interior_coda(w, sets))
-    return rejects / len(test_tokens) * 100.0 if test_tokens else float("nan")
-
-# ----------------------------
-# Extended distance-from-edge legality
-# Zones: onset, i1, mid, i2, coda
-# ----------------------------
-def train_edge_sets(train_tokens: list[str]):
-    onsets = set()
-    i1 = set()
-    mid = set()
-    i2 = set()
-    codas = set()
-
-    for w in train_tokens:
-        L = len(w)
-        if L < 2:
-            continue
-        onsets.add(w[:2])
-        codas.add(w[-2:])
-
-        if L >= 3:
-            i1.add(w[1:3])
-            i2.add(w[-3:-1])
-
-        if L >= 6:
-            for i in range(2, L - 3):  # 2..L-4 inclusive
-                mid.add(w[i:i+2])
-
-    return onsets, i1, mid, i2, codas
-
-def reject_edge_word(w: str, sets, include_short: bool, exclude_short: bool) -> bool:
-    onsets, i1, mid, i2, codas = sets
-    L = len(w)
-
-    if L < 2:
-        return True
-
-    if exclude_short and L < 4:
-        return False  # excluded from evaluation in that mode
-
-    # onset/coda always
-    if w[:2] not in onsets:
-        return True
-    if w[-2:] not in codas:
-        return True
-
-    # interior zones only if present (include_short mode)
-    if L >= 3:
-        seg1 = w[1:3]
-        seg2 = w[-3:-1]
-        if seg1 not in i1:
-            return True
-        if seg2 not in i2:
-            return True
-
-    if L >= 6:
-        for i in range(2, L - 3):
-            if w[i:i+2] not in mid:
-                return True
-
-    return False
-
-def edge_reject_rate(train_tokens: list[str], test_tokens: list[str],
-                     exclude_short: bool,
-                     symmetric_training: bool = True) -> float:
-    # symmetric training is reviewer-proof; keep it True by default
-    if exclude_short and symmetric_training:
-        train_tokens = [w for w in train_tokens if len(w) >= 4]
-        test_scoped = [w for w in test_tokens if len(w) >= 4]
-    elif exclude_short:
-        test_scoped = [w for w in test_tokens if len(w) >= 4]
-    else:
-        test_scoped = list(test_tokens)
-
-    sets = train_edge_sets(train_tokens)
-
-    if not test_scoped:
-        return float("nan")
-
-    rejects = 0
-    for w in test_scoped:
-        if reject_edge_word(w, sets, include_short=not exclude_short, exclude_short=exclude_short):
-            rejects += 1
-
-    return rejects / len(test_scoped) * 100.0
-
-# ----------------------------
-# Reporting helpers
-# ----------------------------
-def md_table(headers, rows) -> str:
-    line1 = "| " + " | ".join(headers) + " |"
-    line2 = "| " + " | ".join(["---"] * len(headers)) + " |"
-    body = ["| " + " | ".join(str(x) for x in r) + " |" for r in rows]
-    return "\n".join([line1, line2] + body)
-
-def write_csv(prefix: str, name: str, headers, rows):
-    out = Path(f"{prefix}_{name}.csv")
-    with out.open("w", encoding="utf-8", newline="") as f:
-        f.write(",".join(headers) + "\n")
-        for r in rows:
-            f.write(",".join(str(x) for x in r) + "\n")
-    return str(out)
-
-# ----------------------------
-# Section presets
-# ----------------------------
-PRESETS = {
-    "recipe": (103, 116),
-    "herbal": (1, 66),
-    "between": (67, 102),  # your “crazy” combined block between herbal and recipe
-    "all": (None, None),
-}
-
-# ----------------------------
-# Strip Gutenberg Headers
-# ----------------------------
+# ============================================================
+# GUTENBERG HANDLING
+# ============================================================
 
 def strip_gutenberg(text: str) -> str:
     lines = text.splitlines()
-    start = None
-    end = None
-
-    for i, line in enumerate(lines):
-        if "START OF THE PROJECT GUTENBERG EBOOK" in line:
+    start = end = None
+    for i, l in enumerate(lines):
+        if "START OF THE PROJECT GUTENBERG EBOOK" in l:
             start = i + 1
-        elif "END OF THE PROJECT GUTENBERG EBOOK" in line:
+        if "END OF THE PROJECT GUTENBERG EBOOK" in l:
             end = i
             break
-
-    if start is None or end is None or start >= end:
+    if start is None or end is None:
         raise ValueError("Gutenberg START/END markers not found")
-
     return "\n".join(lines[start:end])
 
-def load_tokens_from_text_file(path: str, min_len: int) -> list[str]:
+def load_text_tokens(path, min_len):
     raw = Path(path).read_text(encoding="utf-8", errors="replace")
     core = strip_gutenberg(raw)
-    return tokenize(core, min_len=min_len)
+    return tokenize(core, min_len)
 
-# ----------------------------
-# Shuffle Test
-# ----------------------------
+# ============================================================
+# METRICS
+# ============================================================
 
-def randomize_tokens_within_word(tokens: list[str], seed: int) -> list[str]:
-    rng = random.Random(seed)
+def bigram_legality_reject_rate(train_tokens, test_tokens):
+    seen = set()
+    for w in train_tokens:
+        for i in range(len(w) - 1):
+            seen.add(w[i:i+2])
+    rejects = 0
+    for w in test_tokens:
+        for i in range(len(w) - 1):
+            if w[i:i+2] not in seen:
+                rejects += 1
+                break
+    return rejects / len(test_tokens) * 100 if test_tokens else float("nan")
+
+def unseen_bigram_counts(train_tokens, test_tokens):
+    seen = set()
+    for w in train_tokens:
+        for i in range(len(w) - 1):
+            seen.add(w[i:i+2])
+    c = Counter()
+    for w in test_tokens:
+        for i in range(len(w) - 1):
+            bg = w[i:i+2]
+            if bg not in seen:
+                c[bg] += 1
+    return c
+
+def train_ngram(tokens, n):
+    c = Counter()
+    ctx = Counter()
+    alph = set("^$")
+    for w in tokens:
+        seq = "^"*(n-1) + w + "$"
+        alph |= set(seq)
+        for i in range(n-1, len(seq)):
+            ng = tuple(seq[i-(n-1):i+1])
+            c[ng] += 1
+            ctx[ng[:-1]] += 1
+    return c, ctx, alph, n
+
+def score_ngram(tokens, model, K):
+    c, ctx, alph, n = model
+    V = len(alph)
+    lp = chars = 0
+    for w in tokens:
+        seq = "^"*(n-1) + w + "$"
+        for i in range(n-1, len(seq)):
+            ng = tuple(seq[i-(n-1):i+1])
+            p = (c.get(ng, 0) + K) / (ctx.get(ng[:-1], 0) + K*V)
+            lp += -math.log2(p)
+            if ng[-1] != "$":
+                chars += 1
+    if chars == 0:
+        return float("nan"), float("nan")
+    bpc = lp / chars
+    return bpc, 2 ** bpc
+
+def positional_bits(train, test, K):
+    counts = {z: Counter() for z in ("init", "med", "fin")}
+    ctx = {z: Counter() for z in ("init", "med", "fin")}
+    for w in train:
+        L = len(w)
+        for i in range(L - 1):
+            z = "init" if i == 0 else "fin" if i == L - 2 else "med"
+            counts[z][(w[i], w[i+1])] += 1
+            ctx[z][w[i]] += 1
+    out = {}
+    for z in counts:
+        lp = steps = 0
+        for w in test:
+            L = len(w)
+            for i in range(L - 1):
+                zz = "init" if i == 0 else "fin" if i == L - 2 else "med"
+                if zz != z:
+                    continue
+                p = (counts[z].get((w[i], w[i+1]), 0) + K) / (ctx[z].get(w[i], 0) + K*26)
+                lp += -math.log2(p)
+                steps += 1
+        out[z] = lp / steps if steps else float("nan")
+    return out
+
+# ============================================================
+# LEVENSHTEIN ≤ 1 (EXACT)
+# ============================================================
+
+def _deletion_signatures(w: str):
+    for i in range(len(w)):
+        yield w[:i] + w[i+1:]
+
+def build_edit1_index(train_types):
+    """
+    Build indices for edit distance <= 1 checks:
+      - deletion signatures (for insertion/deletion)
+      - substitution signatures (for Hamming-1 substitutions)
+    """
+    sig2lens = defaultdict(set)
+    subst_sigs = set()
+
+    for t in train_types:
+        L = len(t)
+
+        # deletion signatures for insertion/deletion
+        for sig in _deletion_signatures(t):
+            sig2lens[sig].add(L)
+
+        # substitution signatures: replace one position with '*'
+        # e.g. "abcd" -> "*bcd", "a*cd", "ab*d", "abc*"
+        for i in range(L):
+            subst_sigs.add(t[:i] + "*" + t[i+1:])
+
+    return train_types, sig2lens, subst_sigs
+
+
+def has_levenshtein_le1(w, train_set, sig2lens, subst_sigs):
+    # Exact match
+    if w in train_set:
+        return True
+
+    L = len(w)
+
+    # Substitution (same length, Hamming distance 1) via signature lookup
+    # w is within 1 substitution of some train type iff any wildcard signature matches
+    for i in range(L):
+        if (w[:i] + "*" + w[i+1:]) in subst_sigs:
+            return True
+
+    # Insertion/deletion (via deletion signatures)
+    if (L + 1) in sig2lens.get(w, ()):
+        return True
+    for sig in _deletion_signatures(w):
+        if sig in train_set:
+            return True
+        if L in sig2lens.get(sig, ()):
+            return True
+
+    return False
+
+
+def dist01(train, test):
+    train_types = set(train)
+    train_set, sig2lens, subst_sigs = build_edit1_index(train_types)
+    cnt = Counter(test)
+    tot_tok = sum(cnt.values())
+    tot_type = len(cnt)
+    if tot_tok == 0 or tot_type == 0:
+        return dict(d0_tok=float("nan"), d1_tok=float("nan"),
+                    le1_tok=float("nan"), le1_type=float("nan"))
+    d0_tok = d1_tok = d0_type = d1_type = 0
+    for w, c in cnt.items():
+        if w in train_set:
+            d0_tok += c
+            d0_type += 1
+        elif has_levenshtein_le1(w, train_set, sig2lens, subst_sigs):
+            d1_tok += c
+            d1_type += 1
+    return {
+        "d0_tok": d0_tok / tot_tok * 100,
+        "d1_tok": d1_tok / tot_tok * 100,
+        "le1_tok": (d0_tok + d1_tok) / tot_tok * 100,
+        "le1_type": (d0_type + d1_type) / tot_type * 100,
+    }
+
+# ============================================================
+# SHUFFLE CONTROLS
+# ============================================================
+
+def shuffle_within(tokens, rng):
     out = []
     for w in tokens:
-        if len(w) <= 1:
-            out.append(w)
-            continue
-        chars = list(w)
-        rng.shuffle(chars)
-        out.append("".join(chars))
+        ch = list(w)
+        rng.shuffle(ch)
+        out.append("".join(ch))
     return out
 
-def randomize_tokens_global(tokens: list[str], seed: int) -> list[str]:
-    rng = random.Random(seed)
-    lengths = [len(w) for w in tokens]
-    pool = [ch for w in tokens for ch in w]
+def shuffle_global(tokens, rng):
+    pool = [c for w in tokens for c in w]
     rng.shuffle(pool)
-
     out = []
-    idx = 0
-    for L in lengths:
-        out.append("".join(pool[idx:idx+L]))
-        idx += L
+    k = 0
+    for w in tokens:
+        out.append("".join(pool[k:k+len(w)]))
+        k += len(w)
     return out
 
-# ----------------------------
-# Main
-# ----------------------------
+# -------------------------
+# CRILS (Conditional Repairability of Illicit Local Structures)
+# -------------------------
+
+def _train_bigram_set(train_tokens):
+    seen = set()
+    for w in train_tokens:
+        for i in range(len(w) - 1):
+            seen.add(w[i:i+2])
+    return seen
+
+def _token_illicit_by_bigram(w: str, seen_bigrams: set[str]) -> bool:
+    # Illicit if ANY internal bigram is unseen in train
+    for i in range(len(w) - 1):
+        if w[i:i+2] not in seen_bigrams:
+            return True
+    return False
+
+def _unseen_bigram_instances(w: str, seen_bigrams: set[str]) -> int:
+    c = 0
+    for i in range(len(w) - 1):
+        if w[i:i+2] not in seen_bigrams:
+            c += 1
+    return c
+
+def _count_window_violations(tokens, seen_bigrams, i, window):
+    lo = max(0, i - window)
+    hi = min(len(tokens) - 1, i + window)
+    v = 0
+    for j in range(lo, hi + 1):
+        v += _unseen_bigram_instances(tokens[j], seen_bigrams)
+    return v
+
+def _mutate_del(w: str, rng):
+    if len(w) <= 1:
+        return None
+    i = rng.randrange(len(w))
+    return w[:i] + w[i+1:]
+
+def _mutate_swap(w: str, rng):
+    if len(w) <= 1:
+        return None
+    candidates = [i for i in range(len(w)-1) if w[i] != w[i+1]]
+    if not candidates:
+        return None
+    i = rng.choice(candidates)
+    return w[:i] + w[i+1] + w[i] + w[i+2:]
+
+
+def run_crils(train_tokens, test_tokens, *, ops=("del", "swap"), samples=2000, window=2, seed=1):
+    """
+    CRILS (v2): evaluate ALL ops for EACH illicit token.
+    Returns: summary_dict, rows(list of dicts)
+    """
+    import random
+    rng = random.Random(seed)
+
+    seen_bi = _train_bigram_set(train_tokens)
+
+    illicit_idxs = [i for i, w in enumerate(test_tokens) if _token_illicit_by_bigram(w, seen_bi)]
+    if not illicit_idxs:
+        return (
+            dict(
+                N_illicit=0,
+                N_eval=0,
+                mean_delta=float("nan"),
+                pct_pos=float("nan"),
+                pct_zero=float("nan"),
+                pct_neg=float("nan"),
+            ),
+            []
+        )
+
+    if samples is not None and samples > 0 and len(illicit_idxs) > samples:
+        illicit_idxs = rng.sample(illicit_idxs, samples)
+
+    ops = tuple(o.strip() for o in ops if o.strip())
+    if not ops:
+        ops = ("del",)
+
+    rows = []
+    deltas = []
+
+    for i in illicit_idxs:
+        before = _count_window_violations(test_tokens, seen_bi, i, window)
+        w0 = test_tokens[i]
+
+        for op in ops:
+            if op == "del":
+                w1 = _mutate_del(w0, rng)
+            elif op == "swap":
+                w1 = _mutate_swap(w0, rng)
+            else:
+                w1 = None
+
+            if not w1:
+                continue
+
+            tmp = list(test_tokens)
+            tmp[i] = w1
+            after = _count_window_violations(tmp, seen_bi, i, window)
+
+            delta = before - after  # positive = repaired (fewer violations)
+            deltas.append(delta)
+
+            rows.append({
+                "token_index": i,
+                "op": op,
+                "token_before": w0,
+                "token_after": w1,
+                "len_before": len(w0),
+                "len_after": len(w1),
+                "before_violations": before,
+                "after_violations": after,
+                "delta": delta,
+            })
+
+    if not deltas:
+        return (
+            dict(
+                N_illicit=len(illicit_idxs),
+                N_eval=0,
+                mean_delta=float("nan"),
+                pct_pos=float("nan"),
+                pct_zero=float("nan"),
+                pct_neg=float("nan"),
+            ),
+            rows
+        )
+
+    n = len(deltas)
+    pos = sum(1 for d in deltas if d > 0)
+    zer = sum(1 for d in deltas if d == 0)
+    neg = sum(1 for d in deltas if d < 0)
+    mean_delta = sum(deltas) / n
+
+    summary = dict(
+        N_illicit=len(illicit_idxs),  # number of illicit TOKENS sampled
+        N_eval=n,                     # number of evaluated (token,op) pairs
+        mean_delta=mean_delta,
+        pct_pos=pos / n * 100,
+        pct_zero=zer / n * 100,
+        pct_neg=neg / n * 100,
+    )
+    return summary, rows
+
+# ============================================================
+# MAIN
+# ============================================================
+
+PRESETS = {
+    "recipe": (103, 116),
+    "herbal": (1, 66),
+    "between": (67, 102),
+    "all": (None, None),
+}
+
 def main():
-    ap = argparse.ArgumentParser(description="Voynich parser-locked analysis suite (LSI + iParser)")
-    ap.add_argument("--lsi", default="LSI.txt", help="Path to LSI.txt")
-    ap.add_argument("--iparser_dir", default=".", help="Directory containing iParser_guarded.py")
-    ap.add_argument("--transcriber", default="H", help="Transcriber layer (default H)")
-
-    ap.add_argument("--preset", choices=sorted(PRESETS.keys()), default="recipe",
-                    help="Section preset: recipe/herbal/between/all")
-    ap.add_argument("--start", type=int, default=None, help="Custom start folio (overrides preset)")
-    ap.add_argument("--end", type=int, default=None, help="Custom end folio (overrides preset)")
-
-    ap.add_argument("--train_sides", choices=["r", "v", "both"], default="r",
-                    help="Training side(s): r, v, or both")
-    ap.add_argument("--test_sides", choices=["r", "v", "both"], default="v",
-                    help="Testing side(s): r, v, or both")
-
-    ap.add_argument("--min_len", type=int, default=2, help="Minimum token length (default 2)")
-    ap.add_argument("--csv_prefix", default=None, help="If set, write tables to CSV with this prefix")
-    ap.add_argument(
-        "--symmetric_short_filter",
-        choices=["true", "false"],
-        default="true",
-        help="When exclude_short=True (edge-zone test): "
-             "true = apply <4 filter to BOTH train and test; "
-             "false = apply <4 filter to TEST only."
-    )
-    ap.add_argument(
-        "--corpus",
-        choices=["voynich", "text"],
-        default="voynich",
-        help="Input corpus type: voynich (LSI+iParser) or text (plain text file)"
-    )
-    ap.add_argument(
-        "--text_file",
-        default=None,
-        help="Path to plain text file (required if --corpus text)"
-    )
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--lsi", default="LSI.txt")
+    ap.add_argument("--preset", default="recipe")
+    ap.add_argument("--start", type=int)
+    ap.add_argument("--end", type=int)
+    ap.add_argument("--train_sides", default="r")
+    ap.add_argument("--test_sides", default="v")
+    ap.add_argument("--min_len", type=int, default=2)
+    ap.add_argument("--corpus", choices=["voynich", "text"], default="voynich")
+    ap.add_argument("--text_file")
+    ap.add_argument("--transcriber", default="H")
     ap.add_argument(
         "--randomize",
-        choices=["none", "within_word", "global"],
+        choices=["none", "within_tokens", "global_chars"],
         default="none",
         help="Randomization control applied to TEST tokens only (default none)."
     )
+
     ap.add_argument(
         "--rand_seed",
         type=int,
-        default=12345,
-        help="RNG seed for randomization control."
+        default=1
     )
+    ap.add_argument("--dump_unseen_bigrams", default=None)
+    ap.add_argument("--max_unseen_bigrams", type=int, default=5000)
+    ap.add_argument("--K", type=float, default=0.1)
+    
+# -------------------------
+# CRILS (Conditional Repairability of Illicit Local Structures)
+# -------------------------
+    ap.add_argument("--crils", action="store_true",
+                    help="Run CRILS: local edit-distance-1 perturbations on illicit tokens and score repairability.")
+    ap.add_argument("--crils_ops", default="del,swap",
+                    help="Comma list: del,swap. (Boundary ops intentionally omitted for v1.)")
+    ap.add_argument("--crils_samples", type=int, default=2000,
+                    help="Illicit TEST tokens to sample (0 = ALL illicit; >0 = random sample).")
+    ap.add_argument("--crils_window", type=int, default=2,
+                    help="Context window size (tokens left/right) used when scoring violation deltas.")
+    ap.add_argument("--crils_out_csv", default=None,
+                    help="Optional CSV path to write per-sample CRILS rows.")
     args = ap.parse_args()
 
-    sym = (args.symmetric_short_filter == "true")
+    K = args.K
 
-    # ----------------------------
-    # INGESTION
-    # ----------------------------
     if args.corpus == "text":
         if not args.text_file:
             raise ValueError("--text_file is required when --corpus text")
-
-        train_f = []
-        test_f = []
-        start = None
-        end = None
-
-        all_tokens = load_tokens_from_text_file(args.text_file, args.min_len)
-        split = len(all_tokens) // 2
-        train_tokens = all_tokens[:split]
-        test_tokens  = all_tokens[split:]
-
+        tokens = load_text_tokens(args.text_file, args.min_len)
+        mid = len(tokens) // 2
+        train = tokens[:mid]
+        test = tokens[mid:]
     else:
-        # Voynich path (original behavior)
-        ip = import_iparser(args.iparser_dir)
-
-        all_ids = ip.list_folios(args.lsi, transcriber=args.transcriber)
-
-        canon_r = [f for f in all_ids if f.endswith("r")]
-        canon_v = [f for f in all_ids if f.endswith("v")]
-        sub_r   = [f for f in all_ids if ("r" in f and not f.endswith("r") and f.rstrip("0123456789").endswith("r"))]
-        sub_v   = [f for f in all_ids if ("v" in f and not f.endswith("v") and f.rstrip("0123456789").endswith("v"))]
-
-        print("\n=== Corpus inventory (iParser folio IDs) ===")
-        print(f"Total IDs returned by iParser: {len(all_ids)}")
-        print(f"Canonical rectos (end with 'r'): {len(canon_r)}")
-        print(f"Canonical versos (end with 'v'): {len(canon_v)}")
-        print(f"Sub-pages like r2/r3/...: {len(sub_r)}")
-        print(f"Sub-pages like v2/v3/...: {len(sub_v)}")
-
-        preset_start, preset_end = PRESETS[args.preset]
-        start = args.start if args.start is not None else preset_start
-        end = args.end if args.end is not None else preset_end
-
-        train_sides = args.train_sides
-        test_sides = args.test_sides
-
-        if train_sides == "both":
-            train_f = select_folios(ip, args.lsi, args.transcriber, start, end, "r") + \
-                      select_folios(ip, args.lsi, args.transcriber, start, end, "v")
+        if not Path(args.lsi).exists():
+            raise FileNotFoundError("LSI file not found")
+        if args.preset in PRESETS:
+            s, e = PRESETS[args.preset]
         else:
-            train_f = select_folios(ip, args.lsi, args.transcriber, start, end, train_sides)
+            s, e = (args.start, args.end)
+        if args.preset not in PRESETS and args.start is None and args.end is None:
+            raise ValueError(f"Unknown --preset '{args.preset}'. Use one of: {', '.join(PRESETS.keys())} or provide --start/--end.")
 
-        if test_sides == "both":
-            test_f = select_folios(ip, args.lsi, args.transcriber, start, end, "r") + \
-                     select_folios(ip, args.lsi, args.transcriber, start, end, "v")
-        else:
-            test_f = select_folios(ip, args.lsi, args.transcriber, start, end, test_sides)
+        start = args.start if args.start is not None else s
+        end = args.end if args.end is not None else e
+        train_f = select_folios(args.lsi, start, end, args.train_sides, args.transcriber)
+        test_f = select_folios(args.lsi, start, end, args.test_sides, args.transcriber)
+        train = load_voynich_tokens(args.lsi, train_f, args.min_len, args.transcriber)
+        test = load_voynich_tokens(args.lsi, test_f, args.min_len, args.transcriber)
 
-        train_tokens = load_tokens_for_folios(ip, args.lsi, args.transcriber, train_f, args.min_len)
-        test_tokens  = load_tokens_for_folios(ip, args.lsi, args.transcriber, test_f, args.min_len)
-
-    # ----------------------------
-    # RANDOMIZATION CONTROL (test-only)
-    # ----------------------------
     if args.randomize != "none":
-        if args.randomize == "within_word":
-            test_tokens = randomize_tokens_within_word(test_tokens, args.rand_seed)
-        elif args.randomize == "global":
-            test_tokens = randomize_tokens_global(test_tokens, args.rand_seed)
+        import random
+        rng = random.Random(args.rand_seed)
+        if args.randomize == "within_tokens":
+            test = shuffle_within(test, rng)
+        else:  # global_chars
+            test = shuffle_global(test, rng)
 
-    # ----------------------------
-    # COMPUTE SUITE (unchanged)
-    # ----------------------------
-    anywhere_rej = bigram_legality_reject_rate(train_tokens, test_tokens)
+    rej = bigram_legality_reject_rate(train, test)
 
-    bi_model = train_char_ngram(train_tokens, n=2)
-    tri_model = train_char_ngram(train_tokens, n=3)
+    bi = train_ngram(train, 2)
+    tri = train_ngram(train, 3)
+    bi_bpc, _ = score_ngram(test, bi, K)
+    tri_bpc, _ = score_ngram(test, tri, K)
+    delta = bi_bpc - tri_bpc if not math.isnan(bi_bpc) and not math.isnan(tri_bpc) else float("nan")
+    pos = positional_bits(train, test, K)
+    d01 = dist01(train, test)
 
-    bi_bits, bi_ppl = score_char_ngram_bits_per_char(test_tokens, bi_model)
-    tri_bits, tri_ppl = score_char_ngram_bits_per_char(test_tokens, tri_model)
-    delta = bi_bits - tri_bits
+    crils_summary = None
+    if args.crils:
+        ops = tuple(x.strip() for x in args.crils_ops.split(",") if x.strip())
+        crils_summary, crils_rows = run_crils(
+            train, test,
+            ops=ops,
+            samples=args.crils_samples,
+            window=args.crils_window,
+            seed=args.rand_seed
+        )
 
-    pos = positional_bigram_bits(train_tokens, test_tokens)
-    d01 = dist01_rates(train_tokens, test_tokens)
+        if args.crils_out_csv:
+            outp = Path(args.crils_out_csv)
+            outp.parent.mkdir(parents=True, exist_ok=True)
+            with outp.open("w", encoding="utf-8") as f:
+                f.write("token_index,op,token_before,token_after,len_before,len_after,before_violations,after_violations,delta\n")
+                for r in crils_rows:
+                    f.write(f"{r['token_index']},{r['op']},{r['token_before']},{r['token_after']},"
+                            f"{r['len_before']},{r['len_after']},{r['before_violations']},{r['after_violations']},{r['delta']}\n")
 
-    claude_rej = onset_interior_coda_reject_rate(train_tokens, test_tokens)
 
-    edge_excl = edge_reject_rate(train_tokens, test_tokens, exclude_short=True,  symmetric_training=sym)
-    edge_incl = edge_reject_rate(train_tokens, test_tokens, exclude_short=False, symmetric_training=True)
+    def fmt(x, nd=4):
+        return "NA" if math.isnan(x) else f"{x:.{nd}f}"
 
-    # ----------------------------
-    # REPORT
-    # ----------------------------
-    print("\n=== Voynich Suite (parser-locked) ===")
-
-    if args.corpus == "text":
-        print(f"Corpus: TEXT file={args.text_file}")
-    else:
-        print(f"Range: {start}–{end}  Preset: {args.preset}")
-        print(f"Train sides: {args.train_sides}  Test sides: {args.test_sides}")
-        print(f"Train folios: {len(train_f)}  Test folios: {len(test_f)}")
-
-    print(f"Train tokens: {len(train_tokens)}  Test tokens: {len(test_tokens)}")
-    print(f"Min token length: {args.min_len}")
-
-    headers = ["Metric", "Value"]
-    rows = [
-        ("Bigram legality reject% (anywhere)", f"{anywhere_rej:.3f}"),
-        ("Onset/interior/coda reject%", f"{claude_rej:.3f}"),
-        ("Edge-zones reject% (exclude <4, symmetric_short_filter=" + str(sym) + ")", f"{edge_excl:.3f}"),
-        ("Edge-zones reject% (include <4, symmetric)", f"{edge_incl:.3f}"),
-        ("Bigram bits/char", f"{bi_bits:.4f}"),
-        ("Bigram perplexity", f"{bi_ppl:.4f}"),
-        ("Trigram bits/char", f"{tri_bits:.4f}"),
-        ("Trigram perplexity", f"{tri_ppl:.4f}"),
-        ("Δ bits (Bigram − Trigram)", f"{delta:.4f}"),
-        ("Positional bits (init)", f"{pos['init']:.4f}"),
-        ("Positional bits (med)", f"{pos['med']:.4f}"),
-        ("Positional bits (fin)", f"{pos['fin']:.4f}"),
-        ("Dist0 token %", f"{d01.get('dist0_tok_pct', float('nan')):.2f}"),
-        ("Dist1 token %", f"{d01.get('dist1_tok_pct', float('nan')):.2f}"),
-        ("<=1 token %", f"{d01.get('le1_tok_pct', float('nan')):.2f}"),
-        ("<=1 type %", f"{d01.get('le1_type_pct', float('nan')):.2f}"),
-    ]
-    print("\n" + md_table(headers, rows))
-
-    if args.csv_prefix:
-        out = write_csv(args.csv_prefix, "summary", headers, rows)
-        print(f"\nWrote: {out}")
-
+    print("| Metric | Value |")
+    print("| --- | --- |")
+    print(f"| Bigram legality reject% (anywhere) | {fmt(rej,3)} |")
+    print(f"| Bigram bits/char | {fmt(bi_bpc)} |")
+    print(f"| Trigram bits/char | {fmt(tri_bpc)} |")
+    print(f"| Δ bits (Bigram − Trigram) | {fmt(delta)} |")
+    print(f"| Positional bits (init) | {fmt(pos['init'])} |")
+    print(f"| Positional bits (med) | {fmt(pos['med'])} |")
+    print(f"| Positional bits (fin) | {fmt(pos['fin'])} |")
+    print(f"| Levenshtein 0 token % (exact match) | {fmt(d01['d0_tok'],2)} |")
+    print(f"| Levenshtein 1 token % (one edit) | {fmt(d01['d1_tok'],2)} |")
+    print(f"| Levenshtein ≤1 token % | {fmt(d01['le1_tok'],2)} |")
+    print(f"| Levenshtein ≤1 type % | {fmt(d01['le1_type'],2)} |")
+    if crils_summary:
+        print(f"| CRILS N illicit (sampled pool) | {crils_summary['N_illicit']} |")
+        print(f"| CRILS N evaluated (non-noop) | {crils_summary['N_eval']} |")
+        print(f"| CRILS mean Δ violations (before−after) | {fmt(crils_summary['mean_delta'],4)} |")
+        print(f"| CRILS % Δ>0 (repair) | {fmt(crils_summary['pct_pos'],2)} |")
+        print(f"| CRILS % Δ=0 | {fmt(crils_summary['pct_zero'],2)} |")
+        print(f"| CRILS % Δ<0 (breakage) | {fmt(crils_summary['pct_neg'],2)} |")
 
 if __name__ == "__main__":
     main()
+
