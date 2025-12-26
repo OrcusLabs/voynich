@@ -448,33 +448,23 @@ def map_oov_tokens(tokens: List[str], train_chars: Set[str]) -> List[str]:
 
 def bigram_legality_reject_rate(train_tokens: List[str], test_tokens: List[str]) -> float:
     """
-    Token-level reject%: a TEST token is rejected if it contains ANY bigram
-    that was not seen in TRAIN.
-
-    IMPORTANT (consistency fix):
-    - We evaluate bigrams on the same sequence used by the n-gram model:
-      seq = "^" + token + "$"
+    Leakage-free legality:
+    - Build seen bigrams from TRAIN only.
+    - TEST is assumed already OOV-mapped to UNK_CHAR (if desired).
     """
     seen = set()
-
-    # TRAIN bigrams (with boundaries)
     for w in train_tokens:
-        seq = "^" + w + "$"
-        for i in range(len(seq) - 1):
-            seen.add(seq[i:i+2])
+        for i in range(len(w) - 1):
+            seen.add(w[i:i+2])
 
     rejects = 0
-
-    # TEST bigrams (with boundaries)
     for w in test_tokens:
-        seq = "^" + w + "$"
-        for i in range(len(seq) - 1):
-            if seq[i:i+2] not in seen:
+        for i in range(len(w) - 1):
+            if w[i:i+2] not in seen:
                 rejects += 1
                 break
 
     return rejects / len(test_tokens) * 100 if test_tokens else float("nan")
-
 
 def train_ngram(tokens: List[str], n: int):
     c = Counter()
@@ -491,18 +481,22 @@ def train_ngram(tokens: List[str], n: int):
 
     return c, ctx, alph, n
 
-def score_ngram(tokens: list[str], model, K: float) -> float:
+def score_ngram(tokens: list[str], model, K: float, *, V_pred: int, count_eow_in_denom: bool) -> float:
     """
-    BPC IS LOCKED (DO NOT CHANGE):
-    - We score end-of-word '$' (it's included in lp)
-    - We do NOT count '$' in the denominator (chars counts surface letters only)
-    This matches the legacy behavior your submitted ΔBPC was based on.
+    LOCKED BPC DEFINITION (do not change again):
+
+    - We ALWAYS score end-of-word '$' in the log-prob numerator (lp).
+    - Denominator is controlled ONLY by count_eow_in_denom:
+        * True  => denom counts predictions INCLUDING '$'  (this is the ~0.240-ish regime)
+        * False => denom counts surface letters only        (this is the ~0.28-ish regime)
+
+    V_pred is the number of possible NEXT symbols (predicted alphabet), not including '^'.
     """
     c, ctx, alph, n = model
-    V = len(alph)  # LOCKED legacy event space (includes '^' and '$'); do not change
+    V = int(V_pred)
 
     lp = 0.0
-    chars = 0
+    denom = 0
 
     for w in tokens:
         seq = "^" * (n - 1) + w + "$"   # ALWAYS score '$'
@@ -510,10 +504,11 @@ def score_ngram(tokens: list[str], model, K: float) -> float:
             ng = tuple(seq[i - (n - 1): i + 1])
             p = (c.get(ng, 0) + K) / (ctx.get(ng[:-1], 0) + K * V)
             lp += -math.log2(p)
-            if ng[-1] != "$":          # LOCKED: denominator = surface letters only
-                chars += 1
 
-    return lp / chars if chars else float("nan")
+            if count_eow_in_denom or ng[-1] != "$":
+                denom += 1
+
+    return lp / denom if denom else float("nan")
 
 
 def positional_bits(train: List[str], test: List[str], K: float, train_chars: Set[str]) -> Dict[str, float]:
@@ -784,10 +779,17 @@ def main():
     bi = train_ngram(train, 2)
     tri = train_ngram(train, 3)
 
-    # Leakage-free smoothing alphabet sizes (TRAIN ONLY + fixed UNK bucket + boundaries)
-    # For score_ngram: alphabet includes '^' and '$' in the model, plus UNK for OOV mapped in TEST.
-    bi_bpc  = score_ngram(test_mapped, bi, K)
-    tri_bpc = score_ngram(test_mapped, tri, K)
+    # Predicted next-symbol set: train letters + '$' + UNK (never include '^' as a predicted symbol)
+    V_pred = len(train_chars) + 2
+
+    # LOCK THIS CHOICE:
+    #   True  => counts '$' in denom (the “new” ~0.240-ish regime)
+    #   False => excludes '$' from denom (the “old” ~0.28-ish regime)
+    COUNT_EOW_IN_DENOM = False
+
+    bi_bpc  = score_ngram(test_mapped, bi,  K, V_pred=V_pred, count_eow_in_denom=COUNT_EOW_IN_DENOM)
+    tri_bpc = score_ngram(test_mapped, tri, K, V_pred=V_pred, count_eow_in_denom=COUNT_EOW_IN_DENOM)
+
 
 
     # Quantize printed values; compute delta from the same rounded values.
