@@ -448,23 +448,33 @@ def map_oov_tokens(tokens: List[str], train_chars: Set[str]) -> List[str]:
 
 def bigram_legality_reject_rate(train_tokens: List[str], test_tokens: List[str]) -> float:
     """
-    Leakage-free legality:
-    - Build seen bigrams from TRAIN only.
-    - TEST is assumed already OOV-mapped to UNK_CHAR (if desired).
+    Token-level reject%: a TEST token is rejected if it contains ANY bigram
+    that was not seen in TRAIN.
+
+    IMPORTANT (consistency fix):
+    - We evaluate bigrams on the same sequence used by the n-gram model:
+      seq = "^" + token + "$"
     """
     seen = set()
+
+    # TRAIN bigrams (with boundaries)
     for w in train_tokens:
-        for i in range(len(w) - 1):
-            seen.add(w[i:i+2])
+        seq = "^" + w + "$"
+        for i in range(len(seq) - 1):
+            seen.add(seq[i:i+2])
 
     rejects = 0
+
+    # TEST bigrams (with boundaries)
     for w in test_tokens:
-        for i in range(len(w) - 1):
-            if w[i:i+2] not in seen:
+        seq = "^" + w + "$"
+        for i in range(len(seq) - 1):
+            if seq[i:i+2] not in seen:
                 rejects += 1
                 break
 
     return rejects / len(test_tokens) * 100 if test_tokens else float("nan")
+
 
 def train_ngram(tokens: List[str], n: int):
     c = Counter()
@@ -481,23 +491,30 @@ def train_ngram(tokens: List[str], n: int):
 
     return c, ctx, alph, n
 
-def score_ngram(tokens: List[str], model, K: float, V_override: Optional[int] = None) -> float:
+def score_ngram(tokens: list[str], model, K: float) -> float:
+    """
+    BPC IS LOCKED (DO NOT CHANGE):
+    - We score end-of-word '$' (it's included in lp)
+    - We do NOT count '$' in the denominator (chars counts surface letters only)
+    This matches the legacy behavior your submitted ΔBPC was based on.
+    """
     c, ctx, alph, n = model
-    V = V_override if V_override is not None else len(alph)
+    V = len(alph)  # LOCKED legacy event space (includes '^' and '$'); do not change
 
     lp = 0.0
     chars = 0
 
     for w in tokens:
-        seq = "^"*(n-1) + w + "$"
-        for i in range(n-1, len(seq)):
-            ng = tuple(seq[i-(n-1):i+1])
+        seq = "^" * (n - 1) + w + "$"   # ALWAYS score '$'
+        for i in range(n - 1, len(seq)):
+            ng = tuple(seq[i - (n - 1): i + 1])
             p = (c.get(ng, 0) + K) / (ctx.get(ng[:-1], 0) + K * V)
             lp += -math.log2(p)
-            if ng[-1] != "$":
+            if ng[-1] != "$":          # LOCKED: denominator = surface letters only
                 chars += 1
 
     return lp / chars if chars else float("nan")
+
 
 def positional_bits(train: List[str], test: List[str], K: float, train_chars: Set[str]) -> Dict[str, float]:
     """
@@ -769,10 +786,9 @@ def main():
 
     # Leakage-free smoothing alphabet sizes (TRAIN ONLY + fixed UNK bucket + boundaries)
     # For score_ngram: alphabet includes '^' and '$' in the model, plus UNK for OOV mapped in TEST.
-    V_ng = len(train_chars) + 1 + 2   # chars + UNK + (^,$)
+    bi_bpc  = score_ngram(test_mapped, bi, K)
+    tri_bpc = score_ngram(test_mapped, tri, K)
 
-    bi_bpc = score_ngram(test_mapped, bi, K, V_override=V_ng)
-    tri_bpc = score_ngram(test_mapped, tri, K, V_override=V_ng)
 
     # Quantize printed values; compute delta from the same rounded values.
     bi_q = _q4(bi_bpc)
