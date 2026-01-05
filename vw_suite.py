@@ -25,131 +25,6 @@ Defaults:
 - transcriber=H
 - min_len=2
 - K=0.1
-
-#!/usr/bin/env python3
-
-vw_suite.py — Voynich Structural Analysis Suite
-
-============================================================
-COPY / PASTE TEST BATTERY (REPRODUCIBLE COMMANDS)
-============================================================
-
-ASSUMPTIONS
------------
-- LSI transcription file is present as: LSI.txt
-- Working directory contains this script
-- Default smoothing: K = 0.1
-- Default token length floor: min_len = 2
-- Default splat handling: DROP tokens containing '!'
-
-------------------------------------------------------------
-CORE SANITY CHECKS (RECTO ↔ VERSO)
-------------------------------------------------------------
-
-# Recipe section (folios 103–116), train recto → test verso (Takahashi)
-python vw_suite.py --preset recipe --train_sides r --test_sides v --transcriber H
-
-# Reverse sanity check: train verso → test recto (Takahashi)
-python vw_suite.py --preset recipe --train_sides v --test_sides r --transcriber H
-
-
-------------------------------------------------------------
-SECTIONAL TESTS (RECTO → VERSO)
-------------------------------------------------------------
-
-# Herbal section (folios 1–66), Takahashi
-python vw_suite.py --preset herbal --train_sides r --test_sides v --transcriber H
-
-# Middle / "between" section (folios 67–102), Takahashi
-python vw_suite.py --preset between --train_sides r --test_sides v --transcriber H
-
-# Entire corpus, Takahashi
-python vw_suite.py --preset all --train_sides r --test_sides v --transcriber H
-
-
-------------------------------------------------------------
-TRANSCRIBER ROBUSTNESS TESTS (HERBAL, RECTO → VERSO)
-------------------------------------------------------------
-
-# Takahashi (H)
-python vw_suite.py --preset herbal --train_sides r --test_sides v --transcriber H
-
-# Friedman (F)
-python vw_suite.py --preset herbal --train_sides r --test_sides v --transcriber F
-
-# Courier (C)
-python vw_suite.py --preset herbal --train_sides r --test_sides v --transcriber C
-
-# Stolfi (U)
-python vw_suite.py --preset herbal --train_sides r --test_sides v --transcriber U
-
-
-------------------------------------------------------------
-FULL CORPUS TRANSCRIBER CHECK (RECTO → VERSO)
-------------------------------------------------------------
-
-# Entire corpus, Stolfi
-python vw_suite.py --preset all --train_sides r --test_sides v --transcriber U
-
-
-------------------------------------------------------------
-SPLAT HANDLING CONTROLS
-------------------------------------------------------------
-
-# DEFAULT (methodology used in paper):
-#   Tokens containing '!' are DROPPED
-python vw_suite.py --preset recipe --train_sides r --test_sides v --transcriber H
-
-# OPTIONAL CONTROL:
-#   Treat '!' as a word boundary instead of dropping tokens
-python vw_suite.py --preset recipe --train_sides r --test_sides v --transcriber H --split_splats
-
-
-------------------------------------------------------------
-SMOOTHING SENSITIVITY CHECK
-------------------------------------------------------------
-
-# Increase additive smoothing (example K = 1.0)
-python vw_suite.py --preset recipe --train_sides r --test_sides v --transcriber H --K 1.0
-
-------------------------------------------------------------
-RANDOMIZED SHUFFLE TEST
-------------------------------------------------------------
-
-# Shuffles characters *within each token only* (token lengths and per-token character multisets preserved);
-# destroys internal adjacency while retaining token boundaries and global character inventory.
-python vw_suite.py --preset recipe --train_sides r --test_sides v --randomize within_tokens --rand_seed 1234
-
-# Shuffles all characters *globally across the corpus* (overall character frequencies preserved);
-# destroys token boundaries, positional structure, and token-level morphology.
-python vw_suite.py --preset recipe --train_sides r --test_sides v --randomize global_chars --rand_seed 1234
-
-
-------------------------------------------------------------
-GUTENBERG CONTROL CORPUS (50/50 SPLIT)
-------------------------------------------------------------
-
-# Run on a Project Gutenberg text (auto strips headers)
-python vw_suite.py --corpus text --text_file <file name> --min_len 2 --K 0.1
-
-
-------------------------------------------------------------
-EXPECTED OUTPUT METRICS
-------------------------------------------------------------
-
-- Bigram legality reject %
-- Bigram bits / character (BPC2)
-- Trigram bits / character (BPC3)
-- ΔBPC = (Bigram BPC − Trigram BPC), computed from printed values
-- Positional bits per character:
-    * initial
-    * medial
-    * final
-- Levenshtein ≤1 overlap (token %, type %)
-
-All printed values are deterministically rounded and stable across runs.
-
-============================================================
 """
 
 import argparse
@@ -479,212 +354,195 @@ def train_ngram(tokens: List[str], n: int):
             c[ng] += 1
             ctx[ng[:-1]] += 1
 
-    return c, ctx, alph, n
+    # Deterministic ordering for alph (for stable derived counts)
+    alph = set(alph)
+    return c, ctx, alph
 
-def score_ngram(tokens: list[str], model, K: float, *, V_pred: int, count_eow_in_denom: bool) -> float:
+def ngram_bpc(train_tokens: List[str], test_tokens: List[str], n: int, K: float) -> float:
     """
-    LOCKED BPC DEFINITION (do not change again):
-
-    - We ALWAYS score end-of-word '$' in the log-prob numerator (lp).
-    - Denominator is controlled ONLY by count_eow_in_denom:
-        * True  => denom counts predictions INCLUDING '$'  (this is the ~0.240-ish regime)
-        * False => denom counts surface letters only        (this is the ~0.28-ish regime)
-
-    V_pred is the number of possible NEXT symbols (predicted alphabet), not including '^'.
+    Bits per character for an n-gram character model with additive smoothing.
+    - train/test tokens are expected to be already OOV-mapped as desired.
+    - Model uses start symbols ^ and end symbol $.
     """
-    c, ctx, alph, n = model
-    V = int(V_pred)
+    c, ctx, alph = train_ngram(train_tokens, n)
+    V = len(alph)
+    if V == 0:
+        return float("nan")
 
-    lp = 0.0
-    denom = 0
+    total_bits = 0.0
+    total_chars = 0
 
-    for w in tokens:
-        seq = "^" * (n - 1) + w + "$"   # ALWAYS score '$'
-        for i in range(n - 1, len(seq)):
-            ng = tuple(seq[i - (n - 1): i + 1])
-            p = (c.get(ng, 0) + K) / (ctx.get(ng[:-1], 0) + K * V)
-            lp += -math.log2(p)
+    for w in test_tokens:
+        seq = "^"*(n-1) + w + "$"
+        for i in range(n-1, len(seq)):
+            ng = tuple(seq[i-(n-1):i+1])
+            context = ng[:-1]
+            num = c.get(ng, 0)
+            den = ctx.get(context, 0)
+            p = (num + K) / (den + K*V)
+            pos = i - (n-1)
+            if 0 <= pos < len(w):  # only score real characters, not the terminal '$'
+                total_bits += -math.log2(p)
+                total_chars += 1
 
-            if count_eow_in_denom or ng[-1] != "$":
-                denom += 1
+    return (total_bits / total_chars) if total_chars > 0 else float("nan")
 
-    return lp / denom if denom else float("nan")
-
-
-def positional_bits(train: List[str], test: List[str], K: float, train_chars: Set[str]) -> Dict[str, float]:
+def positional_bpc(train_tokens: List[str], test_tokens: List[str], K: float) -> Dict[str, float]:
     """
-    Leakage-free positional cross-entropy (bits/event):
-
-    init:  P(c1 | START)          (word-initial)
-    med:   P(c_{i+1} | c_i)       for within-word transitions only (char -> char)
-    fin:   P(END | c_last)        (word-final termination)
-
-    Smoothing event spaces (correctly separated):
-    - init: next symbols are (train_chars + UNK_CHAR)                  => V_start
-    - med:  next symbols are (train_chars + UNK_CHAR)                  => V_med
-    - fin:  next symbols are {END} only (single-outcome termination)   => V_fin = 1
+    Position-specific BPC for initial, medial, final characters.
+    Unigram positional model with additive smoothing.
     """
-    START = "^"
-    END = "$"
+    # TRAIN counts
+    counts = {"init": Counter(), "med": Counter(), "fin": Counter()}
+    totals = {"init": 0, "med": 0, "fin": 0}
+    alph = set()
 
-    # Train counts
-    c_init = Counter()     # (START, c1)
-    ctx_init = Counter()   # START
-    c_med = Counter()      # (c_i, c_{i+1})
-    ctx_med = Counter()    # c_i
-    c_fin = Counter()      # (c_last, END)
-    ctx_fin = Counter()    # c_last
-
-    for w in train:
+    for w in train_tokens:
         if not w:
             continue
+        alph |= set(w)
+        counts["init"][w[0]] += 1
+        totals["init"] += 1
+        if len(w) > 2:
+            for ch in w[1:-1]:
+                counts["med"][ch] += 1
+                totals["med"] += 1
+        if len(w) > 1:
+            counts["fin"][w[-1]] += 1
+            totals["fin"] += 1
 
-        # init
-        c1 = w[0]
-        c_init[(START, c1)] += 1
-        ctx_init[START] += 1
+    V = max(1, len(alph))
 
-        # med (within-word transitions only)
-        if len(w) >= 2:
-            for i in range(len(w) - 1):
-                c0 = w[i]
-                c1n = w[i + 1]
-                c_med[(c0, c1n)] += 1
-                ctx_med[c0] += 1
-
-        # fin (termination)
-        cl = w[-1]
-        c_fin[(cl, END)] += 1
-        ctx_fin[cl] += 1
-
-    V_start = len(train_chars) + 1   # chars + UNK
-    V_med   = len(train_chars) + 1   # chars + UNK (NO END in medial)
-    V_fin   = 1                      # only END is a legal next event
-
-    out: Dict[str, float] = {}
-
-    # INIT: START -> c1
-    lp = 0.0
-    steps = 0
-    denom_init = ctx_init.get(START, 0) + K * V_start
-    for w in test:
-        if not w:
-            continue
-        c1 = w[0]
-        p = (c_init.get((START, c1), 0) + K) / denom_init
-        lp += -math.log2(p)
-        steps += 1
-    out["init"] = lp / steps if steps else float("nan")
-
-    # MED: c_i -> c_{i+1}  (NO END allowed here)
-    lp = 0.0
-    steps = 0
-    denom_cache: Dict[str, float] = {}
-    for w in test:
-        if len(w) < 2:
-            continue
-        for i in range(len(w) - 1):
-            c0 = w[i]
-            c1n = w[i + 1]
-            denom = denom_cache.get(c0)
-            if denom is None:
-                denom = ctx_med.get(c0, 0) + K * V_med
-                denom_cache[c0] = denom
-            p = (c_med.get((c0, c1n), 0) + K) / denom
-            lp += -math.log2(p)
-            steps += 1
-    out["med"] = lp / steps if steps else float("nan")
-
-    # FIN: c_last -> END  (single-outcome termination; V=1)
-    lp = 0.0
-    steps = 0
-    denom_cache_fin: Dict[str, float] = {}
-    for w in test:
-        if not w:
-            continue
-        cl = w[-1]
-        denom = denom_cache_fin.get(cl)
-        if denom is None:
-            denom = ctx_fin.get(cl, 0) + K * V_fin
-            denom_cache_fin[cl] = denom
-        p = (c_fin.get((cl, END), 0) + K) / denom
-        lp += -math.log2(p)
-        steps += 1
-    out["fin"] = lp / steps if steps else float("nan")
-
+    # TEST scoring
+    out = {}
+    for key in ["init", "med", "fin"]:
+        bits = 0.0
+        nchar = 0
+        for w in test_tokens:
+            if not w:
+                continue
+            if key == "init":
+                chs = [w[0]]
+            elif key == "fin":
+                chs = [w[-1]] if len(w) > 1 else []
+            else:
+                chs = list(w[1:-1]) if len(w) > 2 else []
+            for ch in chs:
+                num = counts[key].get(ch, 0)
+                den = totals[key]
+                p = (num + K) / (den + K*V)
+                bits += -math.log2(p)
+                nchar += 1
+        out[key] = bits / nchar if nchar > 0 else float("nan")
     return out
 
-# ============================================================
-# LEVENSHTEIN ≤ 1
-# ============================================================
-
-def _del_sigs(w: str):
-    for i in range(len(w)):
-        yield w[:i] + w[i+1:]
-
-def build_edit1_index(types: Set[str]):
-    sig2lens = defaultdict(set)
-    subs = set()
-    for t in types:
-        L = len(t)
-        for s in _del_sigs(t):
-            sig2lens[s].add(L)
-        for i in range(L):
-            subs.add(t[:i] + "*" + t[i+1:])
-    return types, sig2lens, subs
-
-def has_lev1(w: str, train: Set[str], sig2lens, subs) -> bool:
-    if w in train:
+def levenshtein_le1(a: str, b: str) -> bool:
+    """
+    True iff Levenshtein distance <= 1 (fast exact check for <=1).
+    """
+    if a == b:
         return True
-    L = len(w)
-    for i in range(L):
-        if w[:i] + "*" + w[i+1:] in subs:
-            return True
-    if (L + 1) in sig2lens.get(w, ()):
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1:
+        return False
+    # Same length: at most one substitution
+    if la == lb:
+        dif = 0
+        for x, y in zip(a, b):
+            if x != y:
+                dif += 1
+                if dif > 1:
+                    return False
         return True
-    for s in _del_sigs(w):
-        if s in train or L in sig2lens.get(s, ()):
-            return True
-    return False
+    # Ensure a is shorter
+    if la > lb:
+        a, b = b, a
+        la, lb = lb, la
+    # Now lb = la+1: at most one insertion in b
+    i = j = 0
+    dif = 0
+    while i < la and j < lb:
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+        else:
+            dif += 1
+            if dif > 1:
+                return False
+            j += 1
+    return True
 
-def dist01(train_tokens: List[str], test_tokens: List[str]) -> Dict[str, float]:
-    train = set(train_tokens)
-    _, sig2lens, subs = build_edit1_index(train)
-    cnt = Counter(test_tokens)
-    tot = sum(cnt.values())
-    d0 = d1 = t0 = t1 = 0
-    for w, c in cnt.items():
-        if w in train:
-            d0 += c; t0 += 1
-        elif has_lev1(w, train, sig2lens, subs):
-            d1 += c; t1 += 1
-    return {
-        "le1_tok": (d0 + d1) / tot * 100 if tot else float("nan"),
-        "le1_type": (t0 + t1) / len(cnt) * 100 if cnt else float("nan"),
-    }
+def le1_overlap(train_tokens: List[str], test_tokens: List[str]) -> Tuple[float, float]:
+    """
+    Returns (token_overlap_pct, type_overlap_pct) where overlap is defined by existence of any train token
+    within Levenshtein distance <= 1.
+    """
+    if not test_tokens:
+        return (float("nan"), float("nan"))
+
+    train_types = sorted(set(train_tokens))
+    test_types = sorted(set(test_tokens))
+
+    # token-level
+    hit = 0
+    for w in test_tokens:
+        ok = False
+        # early exit by length window using sorted list? simplest: brute by length bucket
+        # build length buckets once
+        # (kept deterministic / clear rather than micro-optimized)
+        for t in train_types:
+            if abs(len(t) - len(w)) > 1:
+                continue
+            if levenshtein_le1(t, w):
+                ok = True
+                break
+        if ok:
+            hit += 1
+    token_pct = hit / len(test_tokens) * 100
+
+    # type-level
+    thit = 0
+    for w in test_types:
+        ok = False
+        for t in train_types:
+            if abs(len(t) - len(w)) > 1:
+                continue
+            if levenshtein_le1(t, w):
+                ok = True
+                break
+        if ok:
+            thit += 1
+    type_pct = thit / len(test_types) * 100 if test_types else float("nan")
+
+    return (token_pct, type_pct)
 
 
-def shuffle_within(tokens: List[str], rng: random.Random) -> List[str]:
-    out: List[str] = []
+# ============================================================
+# RANDOMIZATION CONTROLS
+# ============================================================
+
+def randomize_within_tokens(tokens: List[str], rng: random.Random) -> List[str]:
+    out = []
     for w in tokens:
-        ch = list(w)
-        rng.shuffle(ch)
-        out.append("".join(ch))
+        chars = list(w)
+        rng.shuffle(chars)
+        out.append("".join(chars))
     return out
 
-def shuffle_global(tokens: List[str], rng: random.Random) -> List[str]:
-    pool = [c for w in tokens for c in w]
+def randomize_global_chars(tokens: List[str], rng: random.Random) -> List[str]:
+    lengths = [len(w) for w in tokens]
+    pool = list("".join(tokens))
     rng.shuffle(pool)
-    out: List[str] = []
-    k = 0
-    for w in tokens:
-        out.append("".join(pool[k:k+len(w)]))
-        k += len(w)
+    out = []
+    idx = 0
+    for L in lengths:
+        out.append("".join(pool[idx:idx+L]))
+        idx += L
     return out
 
 
 # ============================================================
-# MAIN
+# PRESETS
 # ============================================================
 
 PRESETS = {
@@ -694,129 +552,296 @@ PRESETS = {
     "all": (None, None),
 }
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--lsi", default="LSI.txt")
-    ap.add_argument("--preset", default="recipe")
-    ap.add_argument("--start", type=int)
-    ap.add_argument("--end", type=int)
-    ap.add_argument("--train_sides", default="r")
-    ap.add_argument("--test_sides", default="v")
-    ap.add_argument("--min_len", type=int, default=2)
-    ap.add_argument("--corpus", choices=["voynich", "text"], default="voynich")
-    ap.add_argument("--text_file")
-    ap.add_argument("--transcriber", default="H")
-    ap.add_argument("--K", type=float, default=0.1)
-    ap.add_argument("--split_splats", action="store_true",
-                    help="Optional: split tokens on splat (!) by treating it as a boundary (baseline). Default: drop any token containing !.")
-    ap.add_argument(
-        "--randomize",
-        choices=["none", "within_tokens", "global_chars"],
-        default="none",
-        help="Randomize TEST tokens only: within_tokens or global_chars"
-    )
-    ap.add_argument(
-        "--rand_seed",
-        type=int,
-        default=1,
-        help="Random seed for TEST randomization"
-    )
-    args = ap.parse_args()
 
-    K = args.K
 
-    # ----------------------------
-    # Load tokens (train/test)
-    # ----------------------------
-    if args.corpus == "text":
-        if not args.text_file:
-            raise ValueError("--text_file is required when --corpus text")
-        tokens = load_text_tokens(args.text_file, args.min_len)
-        mid = len(tokens) // 2
-        train = tokens[:mid]
-        test = tokens[mid:]
+# ============================================================
+# INTERACTIVE MENU (optional)
+# ============================================================
+
+def _prompt(msg: str, default: str = "") -> str:
+    d = f" [{default}]" if default else ""
+    try:
+        s = input(f"{msg}{d}: ").strip()
+    except EOFError:
+        s = ""
+    return s if s else default
+
+def _prompt_choice(msg: str, choices: Set[str], default: str) -> str:
+    while True:
+        v = _prompt(msg, default).strip()
+        if v in choices:
+            return v
+        print(f"Invalid choice. Options: {', '.join(sorted({c.upper() for c in choices}))}")
+
+def build_args_from_menu() -> List[str]:
+    """
+    Interactive menu that builds argv (without printing the constructed flags).
+    Designed for: python vw_suite.py   (no args)
+
+    Supports:
+      - Any preset in forward (r->v) or reverse (v->r)
+      - Voynich corpus (LSI) OR external text corpus (--corpus text)
+    """
+    print()
+    print("Voynich Structural Analysis")
+    print()
+
+    corpus = _prompt_choice("Corpus (V=Voynich LSI, T=Text file)", {"V","T","v","t"}, "V").upper()
+
+    args: List[str] = []
+
+    # Common optional knobs (apply to both corpus types)
+    k  = _prompt("Smoothing K", "0.1")
+    ml = _prompt("Min token length", "2")
+    rnd = _prompt_choice("Randomize TEST (N=none, W=within_tokens, G=global_chars)",
+                         {"N","W","G","n","w","g"}, "N").upper()
+    seed = "1234"
+    if rnd != "N":
+        seed = _prompt("Random seed", "1234")
+
+    args += ["--K", k]
+    args += ["--min_len", ml]
+
+    if rnd == "W":
+        args += ["--randomize", "within_tokens", "--rand_seed", seed]
+    elif rnd == "G":
+        args += ["--randomize", "global_chars", "--rand_seed", seed]
+
+    if corpus == "T":
+        # Text corpus path
+        print()
+        print("Text corpus mode")
+        print()
+
+        tf = _prompt("Text file path", "")
+        if not tf:
+            print("No text file provided. Exiting.")
+            raise SystemExit(0)
+
+        args = ["--corpus", "text", "--text_file", tf] + args
+        return args
+
+    # Voynich (LSI) corpus mode
+    print()
+    print("Voynich (LSI) mode")
+    print()
+    print("1) Recipe (103–116)")
+    print("2) Herbal (1–66)")
+    print("3) Between (67–102)")
+    print("4) Entire corpus")
+    print("X) Exit")
+    print()
+
+    sel = _prompt_choice("Select section (1-4 or X)", {"1","2","3","4","X","x"}, "1").upper()
+    if sel == "X":
+        raise SystemExit(0)
+
+    if sel == "1":
+        preset = "recipe"
+    elif sel == "2":
+        preset = "herbal"
+    elif sel == "3":
+        preset = "between"
     else:
-        if not Path(args.lsi).exists():
-            raise FileNotFoundError("LSI file not found")
+        preset = "all"
 
-        if args.preset in PRESETS:
-            s, e = PRESETS[args.preset]
-        else:
-            s, e = (args.start, args.end)
-            if args.start is None and args.end is None:
-                raise ValueError(f"Unknown --preset '{args.preset}'. Use one of: {', '.join(PRESETS.keys())} or provide --start/--end.")
+    direction = _prompt_choice("Direction (F=recto→verso, R=verso→recto)", {"F","R","f","r"}, "F").upper()
+    if direction == "F":
+        train_sides, test_sides = "r", "v"
+    else:
+        train_sides, test_sides = "v", "r"
 
-        start = args.start if args.start is not None else s
-        end   = args.end   if args.end   is not None else e
+    tr = _prompt_choice("Transcriber (H,C,F,U)", {"H","C","F","U","h","c","f","u"}, "H").upper()
+    spl = _prompt_choice("Splat handling (D=drop tokens with !, S=split on !)", {"D","S","d","s"}, "D").upper()
 
-        train_f = select_folios(args.lsi, start, end, args.train_sides, args.transcriber)
-        test_f  = select_folios(args.lsi, start, end, args.test_sides, args.transcriber)
+    # LSI path override (keep existing default behavior intact)
+    lsi = _prompt("LSI transcription path", "LSI.txt")
+    if lsi:
+        args = ["--lsi", lsi] + args
 
-        train = load_voynich_tokens(args.lsi, train_f, args.min_len, args.transcriber, split_splats=args.split_splats)
-        test  = load_voynich_tokens(args.lsi, test_f,  args.min_len, args.transcriber, split_splats=args.split_splats)
+    # Voynich-specific flags
+    args += ["--corpus", "voynich"]
+    args += ["--preset", preset]
+    args += ["--train_sides", train_sides, "--test_sides", test_sides]
+    args += ["--transcriber", tr]
 
-    # ----------------------------
-    # Optional randomization (TEST only)
-    # ----------------------------
-    if args.randomize != "none":
-        rng = random.Random(args.rand_seed)
-        if args.randomize == "within_tokens":
-            test = shuffle_within(test, rng)
-        elif args.randomize == "global_chars":
-            test = shuffle_global(test, rng)
+    if spl == "S":
+        args += ["--split_splats"]
 
-    # ----------------------------
-    # Leakage-free OOV mapping
-    # ----------------------------
-    train_chars = train_char_inventory(train)
-    test_mapped = map_oov_tokens(test, train_chars)
+    return args
 
-    # ----------------------------
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(description="Voynich Structural Analysis Suite")
+    ap.add_argument("--lsi", default="LSI.txt", help="Path to LSI transcription file")
+    ap.add_argument("--corpus", default="voynich", choices=["voynich","text"], help="Corpus type: voynich (LSI) or text (Gutenberg)")
+    ap.add_argument("--text_file", default=None, help="Path to text file when --corpus text")
+
+    ap.add_argument("--preset", default="recipe", choices=sorted(PRESETS.keys()), help="Preset folio range")
+    ap.add_argument("--train_sides", default="r", help="Train sides: r, v, or rv")
+    ap.add_argument("--test_sides", default="v", help="Test sides: r, v, or rv")
+    ap.add_argument("--transcriber", default="H", help="Transcriber code (H,C,F,U,...)")
+    ap.add_argument("--min_len", type=int, default=2, help="Minimum token length")
+    ap.add_argument("--K", type=float, default=0.1, help="Additive smoothing K")
+
+    ap.add_argument("--split_splats", action="store_true", help="Treat '!' as boundary instead of dropping tokens containing it")
+    ap.add_argument("--randomize", default="none", choices=["none","within_tokens","global_chars"],
+                    help="Randomization control for TEST tokens")
+    ap.add_argument("--rand_seed", type=int, default=1234, help="Random seed for randomization controls")
+
+    return ap
+
+
+# ============================================================
+# MAIN RUN
+# ============================================================
+
+def run_voynich(args: argparse.Namespace):
+    start, end = PRESETS[args.preset]
+    train_folios = select_folios(args.lsi, start, end, args.train_sides, args.transcriber)
+    test_folios  = select_folios(args.lsi, start, end, args.test_sides,  args.transcriber)
+
+    train_tokens_raw = load_voynich_tokens(args.lsi, train_folios, args.min_len, args.transcriber, split_splats=args.split_splats)
+    test_tokens_raw  = load_voynich_tokens(args.lsi, test_folios,  args.min_len, args.transcriber, split_splats=args.split_splats)
+
+    # Leakage-free OOV mapping: map TEST chars not seen in TRAIN into UNK_CHAR
+    train_chars = train_char_inventory(train_tokens_raw)
+    train_tokens = train_tokens_raw
+    test_tokens  = map_oov_tokens(test_tokens_raw, train_chars)
+
+    # Optional randomization of TEST
+    rng = random.Random(args.rand_seed)
+    if args.randomize == "within_tokens":
+        test_tokens = randomize_within_tokens(test_tokens, rng)
+    elif args.randomize == "global_chars":
+        test_tokens = randomize_global_chars(test_tokens, rng)
+
     # Metrics
-    # ----------------------------
-    rej = bigram_legality_reject_rate(train, test_mapped)
+    rej = bigram_legality_reject_rate(train_tokens, test_tokens)
+    bpc2 = ngram_bpc(train_tokens, test_tokens, n=2, K=args.K)
+    bpc3 = ngram_bpc(train_tokens, test_tokens, n=3, K=args.K)
+    d_bpc = None
+    qbpc2 = _q4(bpc2)
+    qbpc3 = _q4(bpc3)
+    if qbpc2 is not None and qbpc3 is not None:
+        d_bpc = qbpc2 - qbpc3
 
-    bi = train_ngram(train, 2)
-    tri = train_ngram(train, 3)
+    pos = positional_bpc(train_tokens, test_tokens, K=args.K)
+    tok_ov, type_ov = le1_overlap(train_tokens, test_tokens)
 
-    # Predicted next-symbol set: train letters + '$' + UNK (never include '^' as a predicted symbol)
-    V_pred = len(train_chars) + 2
+    # Output (pipe-free)
+    print()
+    print("=== Voynich Structural Analysis ===")
+    print(f"Preset: {args.preset}")
+    print(f"Train sides: {args.train_sides}   Test sides: {args.test_sides}")
+    print(f"Transcriber: {args.transcriber}")
+    print(f"Min token length: {args.min_len}   K: {args.K}")
+    print(f"Splat handling: {'SPLIT' if args.split_splats else 'DROP TOKENS WITH !'}")
+    print(f"Randomize: {args.randomize}   Seed: {args.rand_seed}")
+    print(f"Train folios: {len(train_folios)}   Test folios: {len(test_folios)}")
+    print(f"Train tokens: {len(train_tokens)}   Test tokens: {len(test_tokens)}")
+    print()
 
-    # LOCK THIS CHOICE:
-    #   True  => counts '$' in denom (the “new” ~0.240-ish regime)
-    #   False => excludes '$' from denom (the “old” ~0.28-ish regime)
-    COUNT_EOW_IN_DENOM = False
+    print(f"Bigram legality reject %: { _fmt(rej, 4) }")
+    print(f"Bigram BPC (BPC2):        { _fmt(bpc2, 4) }")
+    print(f"Trigram BPC (BPC3):       { _fmt(bpc3, 4) }")
+    print(f"ΔBPC (BPC2−BPC3):         { _fmt_q(d_bpc) }")
+    print()
 
-    bi_bpc  = score_ngram(test_mapped, bi,  K, V_pred=V_pred, count_eow_in_denom=COUNT_EOW_IN_DENOM)
-    tri_bpc = score_ngram(test_mapped, tri, K, V_pred=V_pred, count_eow_in_denom=COUNT_EOW_IN_DENOM)
+    print("Positional BPC")
+    print(f"  initial: { _fmt(pos.get('init'), 4) }")
+    print(f"  medial:  { _fmt(pos.get('med'), 4) }")
+    print(f"  final:   { _fmt(pos.get('fin'), 4) }")
+    print()
+
+    print("Levenshtein ≤1 overlap")
+    print(f"  token %: { _fmt(tok_ov, 4) }")
+    print(f"  type %:  { _fmt(type_ov, 4) }")
+    print()
 
 
+def run_text(args: argparse.Namespace):
+    if not args.text_file:
+        raise ValueError("--text_file is required when --corpus text")
 
-    # Quantize printed values; compute delta from the same rounded values.
-    bi_q = _q4(bi_bpc)
-    tri_q = _q4(tri_bpc)
-    delta_q = (bi_q - tri_q) if (bi_q is not None and tri_q is not None) else None
+    tokens_raw = load_text_tokens(args.text_file, args.min_len)
 
-    pos = positional_bits(train, test_mapped, K, train_chars=train_chars)
+    # Simple 50/50 split by token order for control corpus
+    mid = len(tokens_raw) // 2
+    train_tokens = tokens_raw[:mid]
+    test_tokens_raw  = tokens_raw[mid:]
 
-    # Levenshtein overlap should use the original tokens (not OOV-mapped),
-    # because it is a lexical overlap proxy, not a probabilistic model score.
-    d01 = dist01(train, test)
+    # Leakage-free OOV mapping
+    train_chars = train_char_inventory(train_tokens)
+    test_tokens = map_oov_tokens(test_tokens_raw, train_chars)
 
-    # ----------------------------
-    # Output
-    # ----------------------------
-    print("| Metric | Value |")
-    print("| --- | --- |")
-    print(f"| Bigram legality reject% | {_fmt(rej,3)} |")
-    print(f"| Bigram bits/char | {_fmt_q(bi_q)} |")
-    print(f"| Trigram bits/char | {_fmt_q(tri_q)} |")
-    print(f"| ΔBPC (Bigram−Trigram) | {_fmt_q(delta_q)} |")
-    print(f"| Positional bits (init) | {_fmt(pos['init'])} |")
-    print(f"| Positional bits (med) | {_fmt(pos['med'])} |")
-    print(f"| Positional bits (fin) | {_fmt(pos['fin'])} |")
-    print(f"| Levenshtein ≤1 token % | {_fmt(d01['le1_tok'],2)} |")
-    print(f"| Levenshtein ≤1 type % | {_fmt(d01['le1_type'],2)} |")
+    # Optional randomization of TEST
+    rng = random.Random(args.rand_seed)
+    if args.randomize == "within_tokens":
+        test_tokens = randomize_within_tokens(test_tokens, rng)
+    elif args.randomize == "global_chars":
+        test_tokens = randomize_global_chars(test_tokens, rng)
+
+    rej = bigram_legality_reject_rate(train_tokens, test_tokens)
+    bpc2 = ngram_bpc(train_tokens, test_tokens, n=2, K=args.K)
+    bpc3 = ngram_bpc(train_tokens, test_tokens, n=3, K=args.K)
+    qbpc2 = _q4(bpc2)
+    qbpc3 = _q4(bpc3)
+    d_bpc = None
+    if qbpc2 is not None and qbpc3 is not None:
+        d_bpc = qbpc2 - qbpc3
+
+    pos = positional_bpc(train_tokens, test_tokens, K=args.K)
+    tok_ov, type_ov = le1_overlap(train_tokens, test_tokens)
+
+    print()
+    print("=== Text Control Structural Analysis ===")
+    print(f"Text file: {args.text_file}")
+    print(f"Min token length: {args.min_len}   K: {args.K}")
+    print(f"Randomize: {args.randomize}   Seed: {args.rand_seed}")
+    print(f"Train tokens: {len(train_tokens)}   Test tokens: {len(test_tokens)}")
+    print()
+
+    print(f"Bigram legality reject %: { _fmt(rej, 4) }")
+    print(f"Bigram BPC (BPC2):        { _fmt(bpc2, 4) }")
+    print(f"Trigram BPC (BPC3):       { _fmt(bpc3, 4) }")
+    print(f"ΔBPC (BPC2−BPC3):         { _fmt_q(d_bpc) }")
+    print()
+
+    print("Positional BPC")
+    print(f"  initial: { _fmt(pos.get('init'), 4) }")
+    print(f"  medial:  { _fmt(pos.get('med'), 4) }")
+    print(f"  final:   { _fmt(pos.get('fin'), 4) }")
+    print()
+
+    print("Levenshtein ≤1 overlap")
+    print(f"  token %: { _fmt(tok_ov, 4) }")
+    print(f"  type %:  { _fmt(type_ov, 4) }")
+    print()
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    # If run with no args in an interactive terminal, show menu and build args for the user.
+    if len(sys.argv) == 1 and sys.stdin.isatty():
+        argv = build_args_from_menu()
+        # Replace sys.argv so argparse sees the constructed arguments
+        sys.argv = [sys.argv[0]] + argv
+
+    ap = build_parser()
+    args = ap.parse_args(argv)
+
+    if args.corpus == "voynich":
+        run_voynich(args)
+    else:
+        run_text(args)
+
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
